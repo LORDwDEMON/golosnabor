@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>ГолосНабор — указатель</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
+
+  /* Овал как в оригинале: тёмное стекло с ободком, внутри — свечение.
+     Окно 168×119, сам овал 92×65, поля оставлены под свечение и тень. */
+  .oval {
+    position: absolute;
+    left: 38px; right: 38px; top: 27px; bottom: 27px;
+    border-radius: 999px;
+    background: radial-gradient(140% 170% at 50% 45%, rgba(24, 34, 28, 1) 0%, rgba(4, 6, 5, 1) 75%);
+    border: 1px solid rgba(190, 255, 215, .05);
+    box-shadow:
+      0 5px 14px rgba(0, 0, 0, .4),
+      inset 0 1px 1px rgba(255, 255, 255, .05),
+      inset 0 -7px 12px rgba(0, 0, 0, .5);
+    overflow: hidden;
+  }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+</style>
+</head>
+<body>
+<div class="oval" id="oval"><canvas id="gl"></canvas></div>
+<script>
+  const oval = document.getElementById('oval');
+  const canvas = document.getElementById('gl');
+  let gl = null;
+  try {
+    gl = canvas.getContext('webgl', { alpha: true, premultipliedAlpha: false, antialias: true });
+    if (!gl) throw new Error('контекст WebGL не создан');
+  } catch (err) {
+    console.error('ОШИБКА WEBGL: ' + err.message);
+  }
+
+  // Запасной вид без WebGL: мягкая полоса градиентом, чтобы индикатор был виден всегда
+  if (!gl) {
+    const fallback = document.createElement('div');
+    fallback.style.cssText = 'position:absolute;inset:0;' +
+      'background:radial-gradient(60% 22% at 50% 50%, rgba(150,255,190,.55) 0%, rgba(60,200,110,.18) 55%, rgba(0,0,0,0) 100%);' +
+      'animation:pulse 1.4s ease-in-out infinite;';
+    const style = document.createElement('style');
+    style.textContent = '@keyframes pulse{0%,100%{opacity:.55}50%{opacity:.95}}';
+    document.head.appendChild(style);
+    oval.appendChild(fallback);
+    window.overlayApi.onState(() => {});
+    window.overlayApi.onLevel(function (v) {
+      const level = (v && typeof v === 'object') ? (v.rms || 0) : (Number(v) || 0);
+      fallback.style.opacity = String(0.5 + Math.min(0.5, level));
+    });
+  }
+
+  // Палитры по состояниям: три цвета — основа, второй оттенок и ядро.
+  const PALETTE = {
+    listening: { a: [0.16, 0.78, 0.36], b: [0.40, 0.95, 0.62], c: [0.86, 1.0, 0.92], gain: 1.0 },
+    processing: { a: [0.85, 0.52, 0.14], b: [0.95, 0.72, 0.38], c: [0.95, 0.88, 0.72], gain: 0.5 },
+    done: { a: [0.22, 0.86, 0.45], b: [0.52, 1.0, 0.72], c: [0.80, 1.0, 0.90], gain: 1.1 },
+    empty: { a: [0.85, 0.58, 0.20], b: [0.95, 0.78, 0.45], c: [0.95, 0.90, 0.75], gain: 0.3 },
+    error: { a: [0.85, 0.24, 0.22], b: [0.95, 0.45, 0.40], c: [0.95, 0.75, 0.72], gain: 0.6 },
+  };
+
+  const VS = 'attribute vec2 a; void main(){ gl_Position = vec4(a, 0.0, 1.0); }';
+
+  // Свой шейдер по мотивам оригинала: три бегущие волны, мягкое затухание,
+  // маска по краям овала, яркость зависит от полос звука.
+  const FS = `
+    precision mediump float;
+    uniform vec2 uRes;
+    uniform float uTime;
+    uniform float uLow;
+    uniform float uMid;
+    uniform float uHigh;
+    uniform float uGain;
+    uniform vec3 uColorA;
+    uniform vec3 uColorB;
+    uniform vec3 uColorC;
+
+    void main() {
+      vec2 frag = gl_FragCoord.xy;
+      vec2 uv = (frag * 2.0 - uRes) / uRes.y;
+      float aspect = uRes.x / uRes.y;
+      float x = uv.x / aspect;
+      float y = uv.y;
+
+      // мягкие края овала
+      float env = pow(cos(clamp(abs(x) * 0.72, 0.0, 1.0) * 1.5707963), 2.0);
+      float rim = 1.0 - 0.65 * pow(clamp(abs(y) * 1.9, 0.0, 1.0), 2.0);
+
+      vec3 col = vec3(0.0);
+      float core = 0.0;
+
+      for (int i = 0; i < 3; i++) {
+        float fi = float(i);
+        float amp = (0.035 + 0.055 * uLow) * (0.8 + 0.2 * fi);
+        float phase = uTime * (0.45 + fi * 0.22) + fi * 2.1;
+        float wave = sin(x * (1.1 + fi * 0.8) + phase) * amp * env;
+        float d = abs(y - wave);
+        float t = 0.155 + 0.05 * uMid + 0.02 * fi;
+        float glow = exp(-pow(d / t, 2.0)) * (0.18 + 0.24 * uGain * (0.75 + 0.25 * uHigh));
+        glow *= env * rim;
+        vec3 hue = mix(uColorA, uColorB, fi * 0.5);
+        col += hue * glow;
+        core += glow;
+      }
+
+      // широкая дымка вокруг луча: то, что делает свечение «стеклянным»
+      float halo = exp(-pow(y / 0.62, 2.0)) * env * rim;
+      col += uColorC * halo * (0.07 + 0.10 * uGain);
+
+      // тонкое светлое ядро луча
+      float coreLine = exp(-pow(y / (0.045 + 0.016 * uLow), 2.0)) * env * rim;
+      col += uColorC * coreLine * (0.10 + 0.16 * uGain);
+
+      float alpha = clamp(max(max(col.r, col.g), col.b), 0.0, 1.0);
+      gl_FragColor = vec4(col, alpha);
+    }
+  `;
+
+  function compile(type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      throw new Error('шейдер не собрался: ' + gl.getShaderInfoLog(shader));
+    }
+    return shader;
+  }
+
+  const program = gl.createProgram();
+  gl.attachShader(program, compile(gl.VERTEX_SHADER, VS));
+  gl.attachShader(program, compile(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    throw new Error('программа не слинковалась: ' + gl.getProgramInfoLog(program));
+  }
+  gl.useProgram(program);
+
+  const buffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(program, 'a');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+  const uniforms = {
+    res: gl.getUniformLocation(program, 'uRes'),
+    time: gl.getUniformLocation(program, 'uTime'),
+    low: gl.getUniformLocation(program, 'uLow'),
+    mid: gl.getUniformLocation(program, 'uMid'),
+    high: gl.getUniformLocation(program, 'uHigh'),
+    gain: gl.getUniformLocation(program, 'uGain'),
+    a: gl.getUniformLocation(program, 'uColorA'),
+    b: gl.getUniformLocation(program, 'uColorB'),
+    c: gl.getUniformLocation(program, 'uColorC'),
+  };
+
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE);           // аддитивное свечение, как у света
+  gl.clearColor(0, 0, 0, 0);
+
+  let phase = 'listening';
+  let bands = { rms: 0, low: 0, mid: 0, high: 0 };
+  let smooth = { low: 0, mid: 0, high: 0, gain: 0 };
+  let time = 0;
+  let rush = 0;
+
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
+    const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+      gl.viewport(0, 0, w, h);
+    }
+  }
+
+  function frame() {
+    resize();
+    time += 0.016;
+    const palette = PALETTE[phase] || PALETTE.listening;
+
+    // сглаживание, чтобы свечение не дёргалось
+    smooth.low += (bands.low - smooth.low) * 0.18;
+    smooth.mid += (bands.mid - smooth.mid) * 0.15;
+    smooth.high += (bands.high - smooth.high) * 0.12;
+
+    let target;
+    if (phase === 'listening') target = 0.25 + Math.min(1, bands.rms * 3.2) * 0.9;
+    else if (phase === 'processing') target = palette.gain * (0.75 + Math.sin(time * 3.0) * 0.18);
+    else if (phase === 'done') { rush = Math.min(1, rush + 0.05); target = palette.gain * (1.0 - 0.55 * rush); }
+    else target = palette.gain;
+
+    smooth.gain += (target - smooth.gain) * 0.2;
+
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.uniform2f(uniforms.res, canvas.width, canvas.height);
+    gl.uniform1f(uniforms.time, time);
+    gl.uniform1f(uniforms.low, smooth.low);
+    gl.uniform1f(uniforms.mid, smooth.mid);
+    gl.uniform1f(uniforms.high, smooth.high);
+    gl.uniform1f(uniforms.gain, smooth.gain);
+    gl.uniform3fv(uniforms.a, palette.a);
+    gl.uniform3fv(uniforms.b, palette.b);
+    gl.uniform3fv(uniforms.c, palette.c);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    requestAnimationFrame(frame);
+  }
+  frame();
+
+  window.overlayApi.onState(({ phase: next }) => {
+    phase = next || 'listening';
+    rush = 0;
+    oval.className = 'oval';
+  });
+
+  window.overlayApi.onLevel((value) => {
+    if (value && typeof value === 'object') bands = value;
+    else bands = { rms: Number(value) || 0, low: Number(value) || 0, mid: 0, high: 0 };
+  });
+</script>
+</body>
+</html>

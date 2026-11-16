@@ -1,0 +1,12 @@
+{
+  "hotkey": "ScrollLock",
+  "dictationMode": "hold",
+  "language": "ru",
+  "autoPaste": true,
+  "insertMode": "type",
+  "darkTheme": false,
+  "sounds": true,
+  "maxSeconds": 60,
+  "punctuation": "auto",
+  "questionMark": "off"
+}
